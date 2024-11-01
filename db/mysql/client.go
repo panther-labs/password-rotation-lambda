@@ -8,7 +8,6 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -51,7 +50,7 @@ func NewRDSClient(useTLS, dryrun bool) *RDSClient {
 		caCertPool.AppendCertsFromPEM(globalBundle)
 		tlsConfig := &tls.Config{RootCAs: caCertPool}
 		mysql.RegisterTLSConfig("rds", tlsConfig)
-		log.Println("TLS enabled")
+		logger.Debug("TLS enabled")
 	}
 
 	return &RDSClient{
@@ -84,7 +83,7 @@ func (c *RDSClient) SetPassword(ctx context.Context, creds db.NewPassword) error
 
 	t0 := time.Now()
 	_, err = db.ExecContext(ctx, alter)
-	log.Printf("%s: exec response time: %dms", creds.Current.Hostname, time.Now().Sub(t0).Milliseconds())
+	logger.Debug(fmt.Sprintf("%s: exec response time: %dms", creds.Current.Hostname, time.Now().Sub(t0).Milliseconds()))
 	return err
 }
 
@@ -120,7 +119,7 @@ func (c *RDSClient) connect(ctx context.Context, username, password, hostname st
 		db.Close()
 		return nil, err
 	}
-	log.Printf("%s: connect response time: %dms", hostname, time.Now().Sub(t0).Milliseconds())
+	logger.Debug(fmt.Sprintf("%s: connect response time: %dms", hostname, time.Now().Sub(t0).Milliseconds()))
 
 	return db, nil
 }

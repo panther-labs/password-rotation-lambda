@@ -5,7 +5,8 @@ package mysql
 import (
 	"context"
 	"fmt"
-	"log"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"sync"
 	"time"
 
@@ -16,8 +17,37 @@ import (
 	"github.com/square/password-rotation-lambda/v2/db"
 )
 
+var (
+	logger = &zap.Logger{}
+)
+
 func init() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile | log.LUTC)
+	encoderConfig := zapcore.EncoderConfig{
+		TimeKey:        "timestamp",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "caller",
+		MessageKey:     "message",
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.CapitalLevelEncoder,
+		EncodeTime:     zapcore.RFC3339NanoTimeEncoder,
+		EncodeDuration: zapcore.StringDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
+	}
+	config := zap.Config{
+		Level:            zap.NewAtomicLevelAt(zap.WarnLevel),
+		Development:      false,
+		Encoding:         "console",
+		EncoderConfig:    encoderConfig,
+		OutputPaths:      []string{"stdout"},
+		ErrorOutputPaths: []string{"stderr"},
+	}
+	var err error
+	logger, err = config.Build()
+	if err != nil {
+		panic(err)
+	}
 }
 
 // Config configures a PasswordSetter when passed to NewPasswordSetter.
@@ -76,10 +106,10 @@ func NewPasswordSetter(cfg Config) *PasswordSetter {
 // cached so RDS DescribeDBInstances is called only once.
 func (m *PasswordSetter) Init(ctx context.Context, secret map[string]string) error {
 	t0 := time.Now()
-	log.Println("Init call")
+	logger.Debug("Init call")
 	defer func() {
 		d := time.Now().Sub(t0)
-		log.Printf("Init return: %dms", d.Milliseconds())
+		logger.Debug(fmt.Sprintf("Init return: %dms", d.Milliseconds()))
 	}()
 
 	// Rotator calls this func on every step, but only get the dbs once for two
@@ -95,7 +125,7 @@ func (m *PasswordSetter) Init(ctx context.Context, secret map[string]string) err
 	t1 := time.Now()
 	input := &rds.DescribeDBInstancesInput{} // all instances
 	result, err := m.cfg.RDSClient.DescribeDBInstances(input)
-	log.Printf("RDS.DescribeDBInstances response time: %dms", time.Now().Sub(t1).Milliseconds())
+	logger.Debug(fmt.Sprintf("RDS.DescribeDBInstances response time: %dms", time.Now().Sub(t1).Milliseconds()))
 	if err != nil {
 		return err
 	}
@@ -110,7 +140,7 @@ func (m *PasswordSetter) Init(ctx context.Context, secret map[string]string) err
 		// When a db is being created, AWS returns most info but *Endpoint is nil
 		if rds.Endpoint == nil || rds.Endpoint.Address == nil {
 			dbId := aws.StringValue(rds.DBInstanceIdentifier) // aws.String() doesn't check for nil
-			log.Printf("%s has no endpoint address, skipping (database instance is being provisioned or decommissioned)", dbId)
+			logger.Debug(fmt.Sprintf("%s has no endpoint address, skipping (database instance is being provisioned or decommissioned)", dbId))
 			continue
 		}
 
@@ -124,7 +154,7 @@ func (m *PasswordSetter) Init(ctx context.Context, secret map[string]string) err
 		dbs = append(dbs, dbInstance{hostname: *rds.Endpoint.Address})
 		line += fmt.Sprintf(" %s", *rds.Endpoint.Address)
 	}
-	log.Print(line)
+	logger.Debug(line)
 
 	m.dbs = dbs
 	m.initDone = true
@@ -134,10 +164,10 @@ func (m *PasswordSetter) Init(ctx context.Context, secret map[string]string) err
 // SetPassword sets the password on all RDS instances.
 func (m *PasswordSetter) SetPassword(ctx context.Context, creds db.NewPassword) error {
 	t0 := time.Now()
-	log.Println("SetPassword call")
+	logger.Debug("SetPassword call")
 	defer func() {
 		d := time.Now().Sub(t0)
-		log.Printf("SetPassword return: %dms", d.Milliseconds())
+		logger.Debug(fmt.Sprintf("SetPassword return: %dms", d.Milliseconds()))
 	}()
 
 	// Reset flags and errors between attempts to set the password. If this
@@ -154,10 +184,10 @@ func (m *PasswordSetter) SetPassword(ctx context.Context, creds db.NewPassword) 
 // is identical to SetPassword.
 func (m *PasswordSetter) Rollback(ctx context.Context, creds db.NewPassword) error {
 	t0 := time.Now()
-	log.Println("Rollback call")
+	logger.Debug("Rollback call")
 	defer func() {
 		d := time.Now().Sub(t0)
-		log.Printf("Rollback return: %dms", d.Milliseconds())
+		logger.Debug(fmt.Sprintf("Rollback return: %dms", d.Milliseconds()))
 	}()
 
 	swapCreds := db.NewPassword{
@@ -170,10 +200,10 @@ func (m *PasswordSetter) Rollback(ctx context.Context, creds db.NewPassword) err
 // VerifyPassword connects to all RDS to verify that the username and password work.
 func (m *PasswordSetter) VerifyPassword(ctx context.Context, creds db.NewPassword) error {
 	t0 := time.Now()
-	log.Println("VerifyPassword call")
+	logger.Debug("VerifyPassword call")
 	defer func() {
 		d := time.Now().Sub(t0)
-		log.Printf("VerifyPassword return: %dms", d.Milliseconds())
+		logger.Debug(fmt.Sprintf("VerifyPassword return: %dms", d.Milliseconds()))
 	}()
 
 	// Reset flags and errors between attempts to verify the password to prevent
@@ -202,7 +232,7 @@ const (
 //
 // This func is called by SetPassword and Rollback.
 func (m *PasswordSetter) setAll(ctx context.Context, creds db.NewPassword, action string) error {
-	log.Printf("%s password on %d RDS instances, %d in parallel...", action, len(m.dbs), m.cfg.Parallel)
+	logger.Debug(fmt.Sprintf("%s password on %d RDS instances, %d in parallel...", action, len(m.dbs), m.cfg.Parallel))
 	var wg sync.WaitGroup
 
 	for i := range m.dbs {
@@ -215,7 +245,7 @@ func (m *PasswordSetter) setAll(ctx context.Context, creds db.NewPassword, actio
 		}
 
 		if action == rollback_password && !m.dbs[i].set {
-			log.Printf("%s: new password was not set, skip rollback", m.dbs[i].hostname)
+			logger.Debug(fmt.Sprintf("%s: new password was not set, skip rollback", m.dbs[i].hostname))
 			// Sending to maxParallel so that we don't wait indefinitely
 			// for maxParallel channel in the rollback path.
 			m.maxParallel <- true
@@ -227,7 +257,7 @@ func (m *PasswordSetter) setAll(ctx context.Context, creds db.NewPassword, actio
 		go func(dbNo int, creds db.NewPassword) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("%s: PANIC: %v", m.dbs[dbNo].hostname, r)
+					logger.Debug(fmt.Sprintf("%s: PANIC: %v", m.dbs[dbNo].hostname, r))
 				}
 				m.maxParallel <- true
 				wg.Done()
@@ -242,7 +272,7 @@ func (m *PasswordSetter) setAll(ctx context.Context, creds db.NewPassword, actio
 			// --------------------------------------------------------------
 			// Try to set/verify/rollback MySQL user password
 			if err := m.setOne(ctx, creds, action); err != nil {
-				log.Printf("ERROR: %s: %s password failed: %s", m.dbs[dbNo].hostname, action, err)
+				logger.Debug(fmt.Sprintf("ERROR: %s: %s password failed: %s", m.dbs[dbNo].hostname, action, err))
 
 				switch action {
 				case set_password:
@@ -259,7 +289,7 @@ func (m *PasswordSetter) setAll(ctx context.Context, creds db.NewPassword, actio
 			}
 
 			// Success, mark that set/verify/rollback was ok
-			log.Printf("%s: success %s password", m.dbs[dbNo].hostname, action)
+			logger.Debug(fmt.Sprintf("%s: success %s password", m.dbs[dbNo].hostname, action))
 			switch action {
 			case set_password:
 				m.dbs[dbNo].set = true
@@ -274,7 +304,7 @@ func (m *PasswordSetter) setAll(ctx context.Context, creds db.NewPassword, actio
 	}
 
 	// Wait for all the in-flight setOne goroutines to finish
-	log.Printf("waiting for %s password on %d RDS instances...", action, len(m.dbs))
+	logger.Debug(fmt.Sprintf("waiting for %s password on %d RDS instances...", action, len(m.dbs)))
 	wg.Wait()
 
 	// Return error if any database failed to set
@@ -332,13 +362,13 @@ func (m *PasswordSetter) setOne(ctx context.Context, creds db.NewPassword, actio
 		// SetPassword err because  that's the last thing we ran.
 		select {
 		case <-ctx.Done():
-			log.Printf("%s: context cancelled after %s password, not retrying (%d tries remained)", creds.Current.Hostname, action, m.tries-tryNo)
+			logger.Debug(fmt.Sprintf("%s: context cancelled after %s password, not retrying (%d tries remained)", creds.Current.Hostname, action, m.tries-tryNo))
 			return err
 		default:
 		}
 
 		// Sleep between tries
-		log.Printf("%s: error %s password try %d of %d, retry in %s: %s", creds.Current.Hostname, action, tryNo, m.tries, m.cfg.RetryWait, err)
+		logger.Debug(fmt.Sprintf("%s: error %s password try %d of %d, retry in %s: %s", creds.Current.Hostname, action, tryNo, m.tries, m.cfg.RetryWait, err))
 		time.Sleep(m.cfg.RetryWait)
 
 		// Check context again in case it was cancelled during the sleep. Return
@@ -346,7 +376,7 @@ func (m *PasswordSetter) setOne(ctx context.Context, creds db.NewPassword, actio
 		// returning the SetPassword err here would be misleading.
 		select {
 		case <-ctx.Done():
-			log.Printf("%s: context cancelled after %s password retry wait, not retrying (%d tries remained)", creds.Current.Hostname, action, m.tries-tryNo)
+			logger.Debug(fmt.Sprintf("%s: context cancelled after %s password retry wait, not retrying (%d tries remained)", creds.Current.Hostname, action, m.tries-tryNo))
 			return ctx.Err()
 		default:
 		}

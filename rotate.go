@@ -17,8 +17,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/secretsmanager"
 	"github.com/aws/aws-sdk-go/service/secretsmanager/secretsmanageriface"
-
 	"github.com/square/password-rotation-lambda/v2/db"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 const (
@@ -27,17 +29,47 @@ const (
 	AWSPREVIOUS = "AWSPREVIOUS"
 )
 
+var (
+	logger = &zap.Logger{}
+)
+
 func init() {
 	// Don't need data/time because CloudWatch Logs adds it, avoid redundant output:
 	//   2020-12-17T15:28:55.547-05:00	2020/12/17 20:28:55.547200 setter.go:79: Init call
 	// First timestamp from CloudWatch, second from log.
-	log.SetFlags(log.Lshortfile)
+	encoderConfig := zapcore.EncoderConfig{
+		TimeKey:        "timestamp",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "caller",
+		MessageKey:     "message",
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.CapitalLevelEncoder,
+		EncodeTime:     zapcore.RFC3339NanoTimeEncoder,
+		EncodeDuration: zapcore.StringDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
+	}
+	config := zap.Config{
+		Level:            zap.NewAtomicLevelAt(zap.WarnLevel),
+		Development:      false,
+		Encoding:         "console",
+		EncoderConfig:    encoderConfig,
+		OutputPaths:      []string{"stdout"},
+		ErrorOutputPaths: []string{"stderr"},
+	}
+	var err error
+	logger, err = config.Build()
+	if err != nil {
+		panic(err)
+	}
 }
 
 var (
 	// ErrInvalidStep is returned if the "Step" value in the Secrets Manager event
 	// is not one of "createSecret", "setSecret", "testSecret", or "finishSecret".
 	ErrInvalidStep = errors.New("invalid Step value from event")
+	L              = zap.L()
 )
 
 // Config represents the user-provided configuration for a Rotator.
@@ -186,10 +218,10 @@ func (r *Rotator) Handler(ctx context.Context, event map[string]string) (map[str
 // Do not call this function directly. It is exported only for testing.
 func (r *Rotator) CreateSecret(ctx context.Context, event map[string]string) error {
 	t0 := time.Now()
-	log.Println("CreateSecret call")
+	logger.Debug("CreateSecret call")
 	defer func() {
 		d := time.Now().Sub(t0)
-		log.Printf("CreateSecret return: %dms", d.Milliseconds())
+		logger.Debug(fmt.Sprintf("CreateSecret return: %dms", d.Milliseconds()))
 	}()
 
 	/*
@@ -329,7 +361,7 @@ func (r *Rotator) CreateSecret(ctx context.Context, event map[string]string) err
 	if err != nil {
 		return err
 	}
-	log.Printf("new pending secret metadata: %+v", *output)
+	logger.Debug(fmt.Sprintf("new pending secret metadata: %+v", *output))
 
 	return nil
 }
@@ -339,14 +371,14 @@ func (r *Rotator) CreateSecret(ctx context.Context, event map[string]string) err
 // Do not call this function directly. It is exported only for testing.
 func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error {
 	t0 := time.Now()
-	log.Println("SetSecret call")
+	logger.Debug("SetSecret call")
 	defer func() {
 		d := time.Now().Sub(t0)
-		log.Printf("SetSecret return: %dms", d.Milliseconds())
+		logger.Debug(fmt.Sprintf("SetSecret return: %dms", d.Milliseconds()))
 	}()
 
 	if r.skipDb {
-		log.Println("SkipDatabase is enabled, not rotating password on database")
+		logger.Debug("SkipDatabase is enabled, not rotating password on database")
 		return nil
 	}
 
@@ -386,14 +418,14 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 	// This can happen if there's a previous run of the lambda crashed
 	// in TestSecret or FinishSecret steps.
 	// Treat this as if SetPassword has completed successfully.
-	log.Println("Verifying if DB is already set to AWSPENDING version of secret")
+	logger.Debug("Verifying if DB is already set to AWSPENDING version of secret")
 	if err := r.db.VerifyPassword(ctx, creds); err == nil {
 		r.event.Receive(Event{
 			Name: EVENT_END_PASSWORD_ROTATION,
 			Step: "setSecret",
 			Time: r.startTime,
 		})
-		log.Println("DB is already set to AWSPENDING version of secret, no action")
+		logger.Debug("DB is already set to AWSPENDING version of secret, no action")
 		return nil
 	}
 
@@ -402,9 +434,9 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 	// AWSCURRENT version of the secret.  A couple of example of this is
 	// 1. Manual update of password in DB
 	// 2. Secret Manager secret is changed manually
-	log.Println("Verifying if AWSCURRENT version of secret is valid")
+	logger.Debug("Verifying if AWSCURRENT version of secret is valid")
 	if err := r.db.VerifyPassword(ctx, db.NewPassword{Current: curCred, New: curCred}); err != nil {
-		log.Printf("ERROR: DB is not set to AWSCURRENT version of secret, attempting to verify AWSPREVIOUS version: %v", err)
+		logger.Debug(fmt.Sprintf("ERROR: DB is not set to AWSCURRENT version of secret, attempting to verify AWSPREVIOUS version: %v", err))
 		// the current version of secret is out of sync with db.  check if db is in sync with
 		// the previous version of the secret
 		_, prevVals, err := r.getSecret(AWSPREVIOUS)
@@ -414,8 +446,8 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 				Step: "setSecret",
 				Time: time.Now(),
 			})
-			log.Printf("ERROR: unable to retreive previous version of the credential. %v  "+
-				" starting rollback", err)
+			logger.Debug(fmt.Sprintf("ERROR: unable to retreive previous version of the credential. %v  "+
+				" starting rollback", err))
 
 			// calling rollback to remove AWSPENDING Label.
 			return r.rollback(ctx, creds, "SetSecret")
@@ -432,7 +464,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 				Step: "setSecret",
 				Time: time.Now(),
 			})
-			log.Printf("ERROR: all versions of credentials in secret manager is out of sync with db; %v starting rollback", err)
+			logger.Debug(fmt.Sprintf("ERROR: all versions of credentials in secret manager is out of sync with db; %v starting rollback", err))
 
 			// calling rollback to remove AWSPENDING Label.
 			return r.rollback(ctx, creds, "SetSecret")
@@ -442,7 +474,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 			Current: prevCred,
 			New:     newCred,
 		}
-		log.Println("DB is set to AWSPREVIOUS version of secret")
+		logger.Debug("DB is set to AWSPREVIOUS version of secret")
 	}
 
 	// Have user-provided PasswordSetter set database password to new value.
@@ -461,7 +493,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 		// Depending on how the PasswordSetter is configured, this might be a no-op.
 		// Normally, we want to roll back so all dbs instances have the same
 		// password for the given user.
-		log.Printf("ERROR: SetPassword failed, rollback: %s", err)
+		logger.Debug(fmt.Sprintf("ERROR: SetPassword failed, rollback: %s", err))
 		r.event.Receive(Event{
 			Name: EVENT_BEGIN_PASSWORD_ROLLBACK,
 			Step: "setSecret",
@@ -486,14 +518,14 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 // Do not call this function directly. It is exported only for testing.
 func (r *Rotator) TestSecret(ctx context.Context, event map[string]string) error {
 	t0 := time.Now()
-	log.Println("TestSecret call")
+	logger.Debug("TestSecret call")
 	defer func() {
 		d := time.Now().Sub(t0)
-		log.Printf("TestSecret return: %dms", d.Milliseconds())
+		logger.Debug(fmt.Sprintf("TestSecret return: %dms", d.Milliseconds()))
 	}()
 
 	if r.skipDb {
-		log.Println("SkipDatabase is enabled, not verifying password on database")
+		logger.Debug("SkipDatabase is enabled, not verifying password on database")
 		return nil
 	}
 
@@ -534,7 +566,7 @@ func (r *Rotator) TestSecret(ctx context.Context, event map[string]string) error
 	})
 	if err := r.db.VerifyPassword(ctx, creds); err != nil {
 		// Roll back to original password since new password doesn't work
-		log.Printf("ERROR: VerifyPassword failed, rollback: %s", err)
+		logger.Debug(fmt.Sprintf("ERROR: VerifyPassword failed, rollback: %s", err))
 		r.event.Receive(Event{
 			Name: EVENT_BEGIN_PASSWORD_ROLLBACK,
 			Step: "testSecret",
@@ -558,10 +590,10 @@ func (r *Rotator) TestSecret(ctx context.Context, event map[string]string) error
 // Do not call this function directly. It is exported only for testing.
 func (r *Rotator) FinishSecret(ctx context.Context, event map[string]string) error {
 	t0 := time.Now()
-	log.Println("FinishSecret call")
+	logger.Debug("FinishSecret call")
 	defer func() {
 		d := time.Now().Sub(t0)
-		log.Printf("FinishSecret return: %dms", d.Milliseconds())
+		logger.Debug(fmt.Sprintf("FinishSecret return: %dms", d.Milliseconds()))
 	}()
 
 	// Get current and new secrets so we can move the AWSPENDING/CURRENT label
@@ -595,7 +627,7 @@ func (r *Rotator) FinishSecret(ctx context.Context, event map[string]string) err
 	})
 
 	downtime := now.Sub(r.startTime)
-	log.Printf("password downtime: %dms", downtime.Milliseconds())
+	logger.Debug(fmt.Sprintf("password downtime: %dms", downtime.Milliseconds()))
 
 	// Wait for secret replication to complete to all replica regions
 	err = r.checkSecretReplicationStatus()
@@ -611,7 +643,7 @@ func (r *Rotator) FinishSecret(ctx context.Context, event map[string]string) err
 		VersionStage:        aws.String(AWSPENDING),
 	})
 	if err != nil {
-		log.Println(err)
+		logger.Debug(err.Error())
 	}
 
 	r.event.Receive(Event{
@@ -656,7 +688,7 @@ func (r *Rotator) getSecret(stage string) (*secretsmanager.GetSecretValueOutput,
 
 func (r *Rotator) rollback(ctx context.Context, creds db.NewPassword, rotationStep string) error {
 	if err := r.db.Rollback(ctx, creds); err != nil {
-		log.Printf("ERROR: Rollback failed: %s", err)
+		logger.Debug(fmt.Sprintf("ERROR: Rollback failed: %s", err))
 		return errRotationFailed
 	}
 
@@ -673,11 +705,11 @@ func (r *Rotator) rollback(ctx context.Context, creds db.NewPassword, rotationSt
 		VersionStage:        aws.String(AWSPENDING),
 	})
 	if err != nil {
-		log.Printf("ERROR: failed to remove pending secret: %s", err)
+		logger.Debug(fmt.Sprintf("ERROR: failed to remove pending secret: %s", err))
 		return errRotationFailed
 	}
 
-	log.Printf("%s failed but rollback was successful", rotationStep)
+	logger.Debug(fmt.Sprintf("%s failed but rollback was successful", rotationStep))
 
 	return errRotationFailed // always return this error
 }
@@ -687,7 +719,7 @@ func (r *Rotator) rollback(ctx context.Context, creds db.NewPassword, rotationSt
 // to guard against arace condition in AWS that leaves secret replication
 // stuck indefinitely.
 func (r *Rotator) checkSecretReplicationStatus() error {
-	log.Println("checking secret replication status")
+	logger.Debug("checking secret replication status")
 	waitDuration := DEFAULT_REPLICATION_WAIT
 	if r.replicationWait > 0 {
 		waitDuration = r.replicationWait
@@ -708,19 +740,19 @@ func (r *Rotator) checkSecretReplicationStatus() error {
 		for _, status := range secret.ReplicationStatus {
 			if status == nil {
 				replicationSyncComplete = false
-				log.Println("encountered null replication status")
+				logger.Debug("encountered null replication status")
 				break
 			}
 			if *status.Status != secretsmanager.StatusTypeInSync {
 				replicationSyncComplete = false
-				log.Printf("replication status still in (%v) in region (%v) expecting (%v)\n", *status.Status, *status.Region, secretsmanager.StatusTypeInSync)
+				logger.Debug(fmt.Sprintf("replication status still in (%v) in region (%v) expecting (%v)\n", *status.Status, *status.Region, secretsmanager.StatusTypeInSync))
 				break
 			}
 		}
 		// only return success if all secret replica regions are in sync all
 		// other cases are treated as errors
 		if replicationSyncComplete {
-			log.Println("secret replication sync completed successfully")
+			logger.Debug("secret replication sync completed successfully")
 			return nil // success
 		}
 		time.Sleep(500 * time.Millisecond)
