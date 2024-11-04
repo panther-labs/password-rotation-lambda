@@ -408,7 +408,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 	}
 
 	// Combine the current and new credentials. This is plumbed all the way down
-	// into the db.PassswordSetter implementation.
+	// into the db.PasswordSetter implementation.
 	creds := db.NewPassword{
 		Current: curCred,
 		New:     newCred,
@@ -425,7 +425,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 			Step: "setSecret",
 			Time: r.startTime,
 		})
-		logger.Debug("DB is already set to AWSPENDING version of secret, no action")
+		logger.Info("DB is already set to AWSPENDING version of secret, no action")
 		return nil
 	}
 
@@ -436,7 +436,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 	// 2. Secret Manager secret is changed manually
 	logger.Debug("Verifying if AWSCURRENT version of secret is valid")
 	if err := r.db.VerifyPassword(ctx, db.NewPassword{Current: curCred, New: curCred}); err != nil {
-		logger.Debug(fmt.Sprintf("ERROR: DB is not set to AWSCURRENT version of secret, attempting to verify AWSPREVIOUS version: %v", err))
+		logger.Error(fmt.Sprintf("ERROR: DB is not set to AWSCURRENT version of secret, attempting to verify AWSPREVIOUS version: %v", err))
 		// the current version of secret is out of sync with db.  check if db is in sync with
 		// the previous version of the secret
 		_, prevVals, err := r.getSecret(AWSPREVIOUS)
@@ -446,12 +446,13 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 				Step: "setSecret",
 				Time: time.Now(),
 			})
-			logger.Debug(fmt.Sprintf("ERROR: unable to retreive previous version of the credential. %v  "+
+			logger.Error(fmt.Sprintf("ERROR: unable to retreive previous version of the credential. %v  "+
 				" starting rollback", err))
 
 			// calling rollback to remove AWSPENDING Label.
 			return r.rollback(ctx, creds, "SetSecret")
 		}
+
 		prevUsername, prevPassword := r.ss.Credentials(prevVals)
 		prevCred := db.Credentials{
 			Username: prevUsername,
@@ -464,7 +465,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 				Step: "setSecret",
 				Time: time.Now(),
 			})
-			logger.Debug(fmt.Sprintf("ERROR: all versions of credentials in secret manager is out of sync with db; %v starting rollback", err))
+			logger.Error(fmt.Sprintf("ERROR: all versions of credentials in secret manager is out of sync with db; %v starting rollback", err))
 
 			// calling rollback to remove AWSPENDING Label.
 			return r.rollback(ctx, creds, "SetSecret")
@@ -474,7 +475,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 			Current: prevCred,
 			New:     newCred,
 		}
-		logger.Debug("DB is set to AWSPREVIOUS version of secret")
+		logger.Warn("DB is set to AWSPREVIOUS version of secret")
 	}
 
 	// Have user-provided PasswordSetter set database password to new value.
@@ -493,7 +494,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 		// Depending on how the PasswordSetter is configured, this might be a no-op.
 		// Normally, we want to roll back so all dbs instances have the same
 		// password for the given user.
-		logger.Debug(fmt.Sprintf("ERROR: SetPassword failed, rollback: %s", err))
+		logger.Error(fmt.Sprintf("ERROR: SetPassword failed, rollback: %s", err))
 		r.event.Receive(Event{
 			Name: EVENT_BEGIN_PASSWORD_ROLLBACK,
 			Step: "setSecret",
