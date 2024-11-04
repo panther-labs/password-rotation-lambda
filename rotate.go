@@ -425,7 +425,7 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 			Step: "setSecret",
 			Time: r.startTime,
 		})
-		logger.Info("DB is already set to AWSPENDING version of secret, no action")
+		logger.Info("DB is already set to AWSPENDING version of secret, no action needed")
 		return nil
 	}
 
@@ -436,7 +436,8 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 	// 2. Secret Manager secret is changed manually
 	logger.Debug("Verifying if AWSCURRENT version of secret is valid")
 	if err := r.db.VerifyPassword(ctx, db.NewPassword{Current: curCred, New: curCred}); err != nil {
-		logger.Error(fmt.Sprintf("ERROR: DB is not set to AWSCURRENT version of secret, attempting to verify AWSPREVIOUS version: %v", err))
+		// This is also a normal state of affairs.
+		logger.Debug("DB is not set to AWSCURRENT version of secret, attempting to verify AWSPREVIOUS version")
 		// the current version of secret is out of sync with db.  check if db is in sync with
 		// the previous version of the secret
 		_, prevVals, err := r.getSecret(AWSPREVIOUS)
@@ -475,7 +476,8 @@ func (r *Rotator) SetSecret(ctx context.Context, event map[string]string) error 
 			Current: prevCred,
 			New:     newCred,
 		}
-		logger.Warn("DB is set to AWSPREVIOUS version of secret")
+		// DB set to AWSPREVIOUS is the normal state - we do not want to log this unless we're debugging
+		logger.Debug("DB is set to AWSPREVIOUS version of secret")
 	}
 
 	// Have user-provided PasswordSetter set database password to new value.
